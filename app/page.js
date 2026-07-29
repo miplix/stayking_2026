@@ -187,6 +187,8 @@ export default function Page() {
             </div>
           </div>
 
+          <SendPanel rewards={data.rewards} />
+
           <div className="card">
             <div className="batches-header">
               <div>
@@ -291,8 +293,6 @@ export default function Page() {
               );
             })}
           </div>
-
-          <SendPanel rewards={data.rewards} />
         </>
       )}
 
