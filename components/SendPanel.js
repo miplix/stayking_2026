@@ -258,21 +258,40 @@ export default function SendPanel({ rewards }) {
       before = await fetchBalances(recipients.map((r) => r.wallet));
       setBeforeMap(before);
 
-      setMsg(`Отправка ${txs.length} транзакций… подтверди в кошельке`);
-      await walletObj.signAndSendTransactions({
-        transactions: txs.map((t) => ({ receiverId: t.receiverId, actions: t.actions })),
-      });
+      // ВАЖНО: отправляем по ОДНОЙ транзакции за раз. Одним запросом на все 12
+      // HOT не тянет (пытается впихнуть ~960 действий в QR/Telegram-ссылку →
+      // пустой QR и зависание). По одной — каждый запрос маленький, подписывается
+      // штатно; заодно видим прогресс и точно знаем, какие прошли.
+      let cancelled = false;
+      for (let i = 0; i < txs.length; i++) {
+        setMsg(`Подпиши транзакцию ${i + 1} из ${txs.length} в кошельке…`);
+        try {
+          await walletObj.signAndSendTransactions({
+            transactions: [{ receiverId: txs[i].receiverId, actions: txs[i].actions }],
+          });
+        } catch (e) {
+          // Отмена/ошибка на одной транзакции — останавливаемся, остальное
+          // уйдёт в «докинуть». Уже отправленные не трогаем.
+          setErr(`Транзакция ${i + 1} не прошла: ${e?.message || "отменена"}`);
+          cancelled = true;
+          break;
+        }
+      }
 
       setMsg("Проверяю доставку по балансам…");
       const fail = await verifyDelivery(recipients, before);
-      setMsg(
-        fail.length
-          ? `⚠️ Дошло ${recipients.length - fail.length}/${recipients.length}. Не дошло ${fail.length} — можно докинуть.`
-          : `✅ Дошло всем: ${recipients.length}/${recipients.length}.`
-      );
+      if (!cancelled) {
+        setMsg(
+          fail.length
+            ? `⚠️ Дошло ${recipients.length - fail.length}/${recipients.length}. Не дошло ${fail.length} — можно докинуть.`
+            : `✅ Дошло всем: ${recipients.length}/${recipients.length}.`
+        );
+      } else {
+        setMsg(`Остановлено. Дошло ${recipients.length - fail.length}/${recipients.length}. Оставшиеся можно докинуть.`);
+      }
     } catch (e) {
       setPendingWallets(new Set(recipients.map((r) => r.wallet)));
-      setErr(e?.message || "Отправка отменена / ошибка кошелька");
+      setErr(e?.message || "Ошибка отправки");
       if (before) {
         try {
           await verifyDelivery(recipients, before);
@@ -318,7 +337,8 @@ export default function SendPanel({ rewards }) {
           <div className="hint">
             Порядок: 1) проверить всех → 2) зарегистрировать тех, у кого нет
             storage → 3) разослать батчами → 4) сверить, что дошло всем.
-            Подписываешь подключённым NEAR-кошельком (лучше HOT — одним батчем).
+            HOT подписывает по одной транзакции (несколько быстрых
+            подтверждений) — так надёжно; после каждой виден прогресс.
           </div>
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
