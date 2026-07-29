@@ -34,9 +34,9 @@ export async function POST(req) {
 
     const decimals = await ftDecimals(FT_CONTRACT).catch(() => 18);
 
-    const results = await mapLimit(wallets, 20, async (w) => {
+    const results = await mapLimit(wallets, 10, async (w, idx) => {
       try {
-        return { wallet: w, registered: await isRegistered(w, FT_CONTRACT) };
+        return { wallet: w, registered: await isRegistered(w, FT_CONTRACT, { offset: idx }) };
       } catch {
         return { wallet: w, registered: null }; // null = не удалось проверить
       }
