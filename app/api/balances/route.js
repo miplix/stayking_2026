@@ -27,13 +27,26 @@ export async function POST(req) {
     if (!wallets.length) {
       return NextResponse.json({ error: "Пустой список кошельков" }, { status: 400 });
     }
-    const rows = await mapLimit(wallets, 24, async (w, idx) => {
+    let rows = await mapLimit(wallets, 24, async (w, idx) => {
       try {
         return [w, await ftBalanceOf(w, FT_CONTRACT, { offset: idx })];
       } catch {
-        return [w, null]; // null = не удалось прочитать
+        return [w, null];
       }
     });
+    // Второй бережный проход по не прочитанным.
+    const stragglers = rows.filter(([, b]) => b == null).map(([w]) => w);
+    if (stragglers.length) {
+      const retry = await mapLimit(stragglers, 6, async (w, idx) => {
+        try {
+          return [w, await ftBalanceOf(w, FT_CONTRACT, { offset: idx + 1, attempts: 8 })];
+        } catch {
+          return [w, null];
+        }
+      });
+      const fixed = new Map(retry);
+      rows = rows.map(([w, b]) => (b == null && fixed.has(w) ? [w, fixed.get(w)] : [w, b]));
+    }
     const balances = {};
     for (const [w, b] of rows) balances[w] = b;
     return NextResponse.json({ ftContract: FT_CONTRACT, balances });

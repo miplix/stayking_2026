@@ -34,13 +34,31 @@ export async function POST(req) {
 
     const decimals = await ftDecimals(FT_CONTRACT).catch(() => 18);
 
-    const results = await mapLimit(wallets, 24, async (w, idx) => {
+    // Первый проход — быстро, высокий параллелизм.
+    let results = await mapLimit(wallets, 24, async (w, idx) => {
       try {
         return { wallet: w, registered: await isRegistered(w, FT_CONTRACT, { offset: idx }) };
       } catch {
         return { wallet: w, registered: null }; // null = не удалось проверить
       }
     });
+
+    // Второй проход — бережно (низкий параллелизм + больше попыток) добиваем тех,
+    // кого зарезал rate-limit, чтобы «не проверено» стремилось к нулю.
+    const stragglers = results.filter((r) => r.registered === null).map((r) => r.wallet);
+    if (stragglers.length) {
+      const retry = await mapLimit(stragglers, 6, async (w, idx) => {
+        try {
+          return { wallet: w, registered: await isRegistered(w, FT_CONTRACT, { offset: idx + 1, attempts: 8 }) };
+        } catch {
+          return { wallet: w, registered: null };
+        }
+      });
+      const fixed = new Map(retry.map((r) => [r.wallet, r.registered]));
+      results = results.map((r) =>
+        fixed.has(r.wallet) ? { wallet: r.wallet, registered: fixed.get(r.wallet) } : r
+      );
+    }
 
     const unregistered = results.filter((r) => r.registered === false).map((r) => r.wallet);
     const unknown = results.filter((r) => r.registered === null).map((r) => r.wallet);
