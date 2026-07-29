@@ -8,6 +8,7 @@ import {
   rawToHuman,
   buildFtTransferAction,
   buildFtStorageDepositAction,
+  splitTxs,
   computeFtGas,
   TX_GAS_BUDGET,
   STORAGE_DEPOSIT_AMOUNT,
@@ -16,17 +17,10 @@ import {
 // Killswitch: рассылку можно скрыть, задав NEXT_PUBLIC_SEND_ENABLED=false.
 const SEND_ENABLED = process.env.NEXT_PUBLIC_SEND_ENABLED !== "false";
 
-function isOutcomeSuccess(o) {
-  if (!o) return false;
-  const st = o.status ?? o?.final_execution_outcome?.status;
-  if (st == null) return true;
-  if (typeof st === "object" && st.Failure) return false;
-  return true;
-}
-
-// Группируем получателей в NEAR-транзакции по газовому бюджету. storage_deposit
-// и ft_transfer одного получателя всегда в одной транзакции.
-function buildPlan(recipients, decimals, unregSet, includeUnreg, ftGas) {
+// Чистые переводы (без storage_deposit) — режем по газовому бюджету.
+// Регистрацию делаем ОТДЕЛЬНЫМ шагом заранее, чтобы в атомарной транзакции
+// переводов не было ни одного действия, способного упасть.
+function buildTransferPlan(recipients, decimals, ftGas) {
   const txs = [];
   let cur = { actions: [], wallets: [], gas: 0 };
   const flush = () => {
@@ -34,15 +28,12 @@ function buildPlan(recipients, decimals, unregSet, includeUnreg, ftGas) {
       txs.push({ receiverId: FT_CONTRACT, actions: cur.actions, wallets: cur.wallets });
     cur = { actions: [], wallets: [], gas: 0 };
   };
+  const g = parseInt(ftGas, 10);
   for (const r of recipients) {
     const raw = humanToRaw(r.amount, decimals);
     if (raw === "0") continue;
-    const acts = [];
-    if (includeUnreg && unregSet.has(r.wallet)) acts.push(buildFtStorageDepositAction(r.wallet));
-    acts.push(buildFtTransferAction(r.wallet, raw, "staking payout", ftGas));
-    const g = acts.reduce((s, a) => s + parseInt(a.params.gas, 10), 0);
     if (cur.actions.length && cur.gas + g > TX_GAS_BUDGET) flush();
-    cur.actions.push(...acts);
+    cur.actions.push(buildFtTransferAction(r.wallet, raw, "staking payout", ftGas));
     cur.wallets.push(r.wallet);
     cur.gas += g;
   }
@@ -68,13 +59,13 @@ export default function SendPanel({ rewards }) {
 
   const [preflight, setPreflight] = useState(null);
   const [preflightBusy, setPreflightBusy] = useState(false);
-  const [includeUnreg, setIncludeUnreg] = useState(false);
   const [perTx, setPerTx] = useState(80); // переводов в одной транзакции
 
+  const [registering, setRegistering] = useState(false);
   const [sending, setSending] = useState(false);
   const [pendingWallets, setPendingWallets] = useState(null);
-  const [beforeMap, setBeforeMap] = useState(null); // снимок балансов до
-  const [delivery, setDelivery] = useState(null); // {rows, ok, fail}
+  const [beforeMap, setBeforeMap] = useState(null);
+  const [delivery, setDelivery] = useState(null);
   const [verifying, setVerifying] = useState(false);
   const [msg, setMsg] = useState("");
   const [err, setErr] = useState("");
@@ -152,14 +143,11 @@ export default function SendPanel({ rewards }) {
     [rewards, decimals]
   );
 
+  // Отправляем ТОЛЬКО зарегистрированным (не в unregistered и не unknown).
   const sendable = useMemo(() => {
-    if (!preflight) return nonZero;
-    return nonZero.filter((r) => {
-      if (unknownSet.has(r.wallet)) return false;
-      if (unregSet.has(r.wallet)) return includeUnreg;
-      return true;
-    });
-  }, [nonZero, preflight, unregSet, unknownSet, includeUnreg]);
+    if (!preflight) return [];
+    return nonZero.filter((r) => !unregSet.has(r.wallet) && !unknownSet.has(r.wallet));
+  }, [nonZero, preflight, unregSet, unknownSet]);
 
   const totalRaw = useMemo(
     () => sendable.reduce((acc, r) => acc + BigInt(humanToRaw(r.amount, decimals)), 0n),
@@ -167,13 +155,14 @@ export default function SendPanel({ rewards }) {
   );
 
   const plan = useMemo(
-    () => buildPlan(sendable, decimals, unregSet, includeUnreg, ftGas),
-    [sendable, decimals, unregSet, includeUnreg, ftGas]
+    () => buildTransferPlan(sendable, decimals, ftGas),
+    [sendable, decimals, ftGas]
   );
 
   const senderBalRaw = preflight?.senderBalance ? BigInt(preflight.senderBalance) : null;
   const insufficient = senderBalRaw != null && senderBalRaw < totalRaw;
-  const nearEstimate = (plan.length * 0.03).toFixed(2); // грубая оценка газа
+  const nearEstimate = (plan.length * 0.03).toFixed(2);
+  const busy = registering || sending || verifying || preflightBusy;
 
   const runPreflight = async () => {
     if (!wallet) return;
@@ -199,7 +188,35 @@ export default function SendPanel({ rewards }) {
     }
   };
 
-  // Проверка доставки: сравниваем балансы после с сохранённым снимком «до».
+  // Шаг 1: регистрируем незарегистрированных ОТДЕЛЬНЫМИ транзакциями (storage_deposit).
+  const registerUnregistered = async () => {
+    if (!walletObj?.signAndSendTransactions) {
+      setErr("Кошелёк не поддерживает пакетную отправку");
+      return;
+    }
+    const targets = preflight?.unregistered ?? [];
+    if (!targets.length) return;
+    const actions = targets.map((w) => buildFtStorageDepositAction(w));
+    const txs = splitTxs(actions, FT_CONTRACT);
+    setRegistering(true);
+    setErr("");
+    setMsg(`Регистрация ${targets.length} адресов (${txs.length} тр.)… подтверди в кошельке`);
+    try {
+      await walletObj.signAndSendTransactions({
+        transactions: txs.map((t) => ({ receiverId: t.receiverId, actions: t.actions })),
+      });
+      setMsg("Регистрация отправлена. Перепроверяю…");
+      await runPreflight();
+      setMsg("Готово. Проверь, что незарегистрированных стало 0, и рассылай.");
+    } catch (e) {
+      setErr(e?.message || "Регистрация отменена / ошибка кошелька");
+      setMsg("");
+    } finally {
+      setRegistering(false);
+    }
+  };
+
+  // Проверка доставки: балансы после vs снимок «до».
   const verifyDelivery = async (recipients, before) => {
     setVerifying(true);
     try {
@@ -221,12 +238,13 @@ export default function SendPanel({ rewards }) {
     }
   };
 
+  // Шаг 2: чистая рассылка переводов (все получатели уже зарегистрированы).
   async function doSend(recipients) {
     if (!walletObj?.signAndSendTransactions) {
       setErr("Кошелёк не поддерживает пакетную отправку");
       return;
     }
-    const txs = buildPlan(recipients, decimals, unregSet, includeUnreg, ftGas);
+    const txs = buildTransferPlan(recipients, decimals, ftGas);
     if (!txs.length) {
       setErr("Нечего отправлять");
       return;
@@ -234,20 +252,17 @@ export default function SendPanel({ rewards }) {
     setSending(true);
     setErr("");
     setDelivery(null);
-    setMsg(`Снимаю балансы до отправки…`);
-    let before = beforeMap;
+    setMsg("Снимаю балансы до отправки…");
+    let before = null;
     try {
-      // 1) снимок балансов ДО
       before = await fetchBalances(recipients.map((r) => r.wallet));
       setBeforeMap(before);
 
-      // 2) подпись и отправка всех транзакций одним вызовом
       setMsg(`Отправка ${txs.length} транзакций… подтверди в кошельке`);
       await walletObj.signAndSendTransactions({
         transactions: txs.map((t) => ({ receiverId: t.receiverId, actions: t.actions })),
       });
 
-      // 3) проверка доставки по дельте балансов
       setMsg("Проверяю доставку по балансам…");
       const fail = await verifyDelivery(recipients, before);
       setMsg(
@@ -256,7 +271,6 @@ export default function SendPanel({ rewards }) {
           : `✅ Дошло всем: ${recipients.length}/${recipients.length}.`
       );
     } catch (e) {
-      // Отклонено/ошибка — пробуем всё равно свериться по балансам (вдруг часть прошла).
       setPendingWallets(new Set(recipients.map((r) => r.wallet)));
       setErr(e?.message || "Отправка отменена / ошибка кошелька");
       if (before) {
@@ -278,14 +292,14 @@ export default function SendPanel({ rewards }) {
     doSend(sendable.filter((r) => pendingWallets.has(r.wallet)));
   };
   const reVerify = () => {
-    if (!beforeMap) return;
-    verifyDelivery(sendable, beforeMap);
+    if (beforeMap) verifyDelivery(sendable, beforeMap);
   };
 
   if (!SEND_ENABLED) return null;
   if (!rewards?.length) return null;
 
   const fmt = (raw) => rawToHuman(raw.toString(), decimals);
+  const unregCount = preflight?.unregistered.length ?? 0;
 
   return (
     <div className="card" style={{ borderColor: "#3a2a5a" }}>
@@ -293,9 +307,9 @@ export default function SendPanel({ rewards }) {
         <div>
           <h2>Рассылка наград ({FT_CONTRACT})</h2>
           <div className="hint">
-            Мультиотправка токена держателям пачками. Подписываешь подключённым
-            NEAR-кошельком (лучше HOT — подтверждение одним батчем). После
-            отправки автоматически сверяю балансы «до/после» — дошло ли каждому.
+            Порядок: 1) проверить всех → 2) зарегистрировать тех, у кого нет
+            storage → 3) разослать батчами → 4) сверить, что дошло всем.
+            Подписываешь подключённым NEAR-кошельком (лучше HOT — одним батчем).
           </div>
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
@@ -317,8 +331,8 @@ export default function SendPanel({ rewards }) {
       {wallet && (
         <>
           <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginTop: 12, alignItems: "flex-end" }}>
-            <button type="button" className="secondary" onClick={runPreflight} disabled={preflightBusy}>
-              {preflightBusy ? "Проверяем получателей…" : "Проверить получателей"}
+            <button type="button" className="secondary" onClick={runPreflight} disabled={busy}>
+              {preflightBusy ? "Проверяем…" : "1. Проверить получателей"}
             </button>
             <div className="field" style={{ flex: "0 1 200px" }}>
               <label htmlFor="pertx">Переводов в транзакции</label>
@@ -346,7 +360,7 @@ export default function SendPanel({ rewards }) {
                 </div>
                 <div className="stat">
                   <div className="label">Не зарегистр.</div>
-                  <div className="value">{preflight.unregistered.length}</div>
+                  <div className="value">{unregCount}</div>
                 </div>
                 <div className="stat">
                   <div className="label">К отправке</div>
@@ -373,22 +387,18 @@ export default function SendPanel({ rewards }) {
             </>
           )}
 
-          {preflight && preflight.unregistered.length > 0 && (
-            <label style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 12 }}>
-              <input
-                type="checkbox"
-                checked={includeUnreg}
-                onChange={(e) => setIncludeUnreg(e.target.checked)}
-              />
-              <span>
-                Регистрировать незарегистрированных ({preflight.unregistered.length}) — +
-                {rawToHuman(
-                  (BigInt(STORAGE_DEPOSIT_AMOUNT) * BigInt(preflight.unregistered.length)).toString(),
-                  24
-                )}{" "}
-                NEAR за storage. Иначе они пропускаются.
-              </span>
-            </label>
+          {preflight && unregCount > 0 && (
+            <div style={{ marginTop: 16, padding: 12, border: "1px solid #6a4a2a", borderRadius: 8 }}>
+              <div style={{ marginBottom: 8 }}>
+                <b>{unregCount}</b> адресов без storage — им перевод упадёт. Сначала
+                зарегистрируй их: +
+                {rawToHuman((BigInt(STORAGE_DEPOSIT_AMOUNT) * BigInt(unregCount)).toString(), 24)} NEAR.
+              </div>
+              <button type="button" onClick={registerUnregistered} disabled={busy} style={{ background: "#6a4a2a" }}>
+                {registering ? <span className="spinner" /> : null}
+                {registering ? "Регистрация…" : `2. Зарегистрировать (${unregCount})`}
+              </button>
+            </div>
           )}
 
           {preflight && preflight.unknown.length > 0 && (
@@ -408,20 +418,21 @@ export default function SendPanel({ rewards }) {
               <button
                 type="button"
                 onClick={sendAll}
-                disabled={sending || verifying || insufficient || !sendable.length}
+                disabled={busy || insufficient || !sendable.length || unregCount > 0}
                 style={{ background: "#7a2e3e" }}
+                title={unregCount > 0 ? "Сначала зарегистрируй незарегистрированных" : undefined}
               >
                 {sending ? <span className="spinner" /> : null}
-                {sending ? "Отправка…" : `Разослать (${sendable.length})`}
+                {sending ? "Отправка…" : `3. Разослать (${sendable.length})`}
               </button>
               {pendingWallets && pendingWallets.size > 0 && (
-                <button type="button" className="secondary" onClick={sendRemaining} disabled={sending || verifying}>
+                <button type="button" className="secondary" onClick={sendRemaining} disabled={busy}>
                   Докинуть оставшиеся ({pendingWallets.size})
                 </button>
               )}
               {beforeMap && (
-                <button type="button" className="ghost" onClick={reVerify} disabled={sending || verifying}>
-                  {verifying ? "Проверяю…" : "Проверить доставку ещё раз"}
+                <button type="button" className="ghost" onClick={reVerify} disabled={busy}>
+                  {verifying ? "Проверяю…" : "4. Проверить доставку ещё раз"}
                 </button>
               )}
             </div>
