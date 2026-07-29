@@ -48,7 +48,7 @@ export default function Page() {
     setProcessed(new Set()); // сброс отметок при новом расчёте
     setLoading(true);
     try {
-      const resp = await fetch("/api/calculate", {
+      const resp = await fetch("/staking/api/calculate", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
