@@ -298,7 +298,16 @@ export default function SendPanel({ rewards }) {
   if (!SEND_ENABLED) return null;
   if (!rewards?.length) return null;
 
-  const fmt = (raw) => rawToHuman(raw.toString(), decimals);
+  // Красивый вывод: группировка разрядов + не более 6 знаков после запятой.
+  const numFmt = new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 6 });
+  const numFmtShort = new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 2 });
+  const fmtWith = (nf) => (raw) => {
+    const human = rawToHuman(raw.toString(), decimals);
+    const n = Number(human);
+    return Number.isFinite(n) ? nf.format(n) : human;
+  };
+  const fmt = fmtWith(numFmt); // суммы наград (до 6 знаков)
+  const fmtShort = fmtWith(numFmtShort); // баланс (2 знака)
   const unregCount = preflight?.unregistered.length ?? 0;
 
   return (
@@ -372,11 +381,13 @@ export default function SendPanel({ rewards }) {
                 </div>
                 <div className="stat">
                   <div className="label">Сумма к отправке</div>
-                  <div className="value">{fmt(totalRaw)}</div>
+                  <div className="value" style={{ overflowWrap: "anywhere" }}>{fmt(totalRaw)}</div>
                 </div>
                 <div className="stat">
                   <div className="label">Баланс кошелька</div>
-                  <div className="value">{senderBalRaw != null ? fmt(senderBalRaw) : "—"}</div>
+                  <div className="value" style={{ overflowWrap: "anywhere" }}>
+                    {senderBalRaw != null ? fmtShort(senderBalRaw) : "—"}
+                  </div>
                 </div>
               </div>
 

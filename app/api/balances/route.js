@@ -27,7 +27,7 @@ export async function POST(req) {
     if (!wallets.length) {
       return NextResponse.json({ error: "Пустой список кошельков" }, { status: 400 });
     }
-    const rows = await mapLimit(wallets, 10, async (w, idx) => {
+    const rows = await mapLimit(wallets, 24, async (w, idx) => {
       try {
         return [w, await ftBalanceOf(w, FT_CONTRACT, { offset: idx })];
       } catch {
