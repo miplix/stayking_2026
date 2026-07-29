@@ -1,6 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import SendPanel from "@/components/SendPanel";
 
 function batchToCsv(batch) {
   // формат как в Python create_sender_batches:
@@ -290,6 +291,8 @@ export default function Page() {
               );
             })}
           </div>
+
+          <SendPanel rewards={data.rewards} />
         </>
       )}
 
